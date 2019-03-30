@@ -1,22 +1,26 @@
 '''
 This module contains useful canned methods for accessing the Comic Vine
 database (API) over the Internet.  The documentation for this API and the 
-related queries can be found at:  http://comicvine.com/api/documentation/
+related queries can be found at: 
+  
+     http://comicvine.gamespot.com/api/documentation/
 
 All public methods in this module require you to pass in a valid ComicVine
 API key as their first argument.  Please do not use my API key!
-You can easily obtain your own key for free at: http://www.comicvine.com/api
+You can easily obtain your own key for free at: 
+
+     http://www.comicvine.gamespot.com/api
 
 @author: Cory Banack
 '''
 
+import re
 import clr
 import log
 import xml2py
+import utils
 from utils import sstr
 from dberrors import DatabaseConnectionError
-import utils
-import re
 
 clr.AddReference('System')
 from System import DateTime
@@ -33,7 +37,7 @@ __CLIENTID = '&client=cvscraper'
 __next_query_time_ms = 0
 
 # the amount of time to wait between queries
-__QUERY_DELAY_MS = 1250 
+__QUERY_DELAY_MS = 1100 
 
 # =============================================================================
 def _query_series_ids_dom(API_KEY, searchterm_s, page_n=1):
@@ -48,7 +52,7 @@ def _query_series_ids_dom(API_KEY, searchterm_s, page_n=1):
    '''
    
    # {0} is the search string, {1} is the page number of the results we want
-   QUERY = 'http://comicvine.com/api/search/?api_key=' + API_KEY + \
+   QUERY = 'http://comicvine.gamespot.com/api/search/?api_key=' + API_KEY + \
       __CLIENTID + '&format=xml&limit=100&resources=volume' + \
       '&field_list=name,start_year,publisher,id,image,count_of_issues' + \
       '&query={0}'
@@ -57,7 +61,7 @@ def _query_series_ids_dom(API_KEY, searchterm_s, page_n=1):
       
    if searchterm_s is None or searchterm_s == '' or page_n < 0:
       raise ValueError('bad parameters')
-   searchterm_s = " AND ".join( re.split(r'\s+', searchterm_s) ); # issue 349
+   searchterm_s = " ".join( re.split(r'\s+', searchterm_s) );
    return __get_dom(QUERY.format(HttpUtility.UrlPathEncode(searchterm_s))+PAGE)
 
 
@@ -71,7 +75,7 @@ def _query_series_details_dom(API_KEY, seriesid_s):
    This method doesn't return null, but it may throw Exceptions.
    '''
    # {0} is the series id, an integer.
-   QUERY = 'http://comicvine.com/api/volume/4050-{0}/?api_key=' \
+   QUERY = 'http://comicvine.gamespot.com/api/volume/4050-{0}/?api_key=' \
      + API_KEY + __CLIENTID + '&format=xml' \
      + '&field_list=name,start_year,publisher,image,count_of_issues,id'
       # parsing relies on 'field_list' specifying 2 or more elements!!
@@ -94,7 +98,7 @@ def _query_issue_ids_dom(API_KEY, seriesid_s, page_n=1):
    '''
    
    # {0} is the series ID, an integer     
-   QUERY = 'http://comicvine.com/api/issues/?api_key=' + API_KEY + __CLIENTID +\
+   QUERY = 'http://comicvine.gamespot.com/api/issues/?api_key=' + API_KEY + __CLIENTID +\
       '&format=xml&field_list=name,issue_number,id,image&filter=volume:{0}'
    PAGE = "" if page_n == 1 \
       else "&page={0}&offset={1}".format(page_n, (page_n-1)*100)
@@ -114,7 +118,7 @@ def _query_issue_id_dom(API_KEY, seriesid_s, issue_num_s):
    '''
    
    # {0} is the series ID, an integer, and {1} is issue number, a string     
-   QUERY = 'http://comicvine.com/api/issues/?api_key=' + API_KEY + \
+   QUERY = 'http://comicvine.gamespot.com/api/issues/?api_key=' + API_KEY + \
       __CLIENTID + '&format=xml&field_list=name,issue_number,id,image' + \
       '&filter=volume:{0},issue_number:{1}'
    
@@ -142,7 +146,7 @@ def _query_issue_details_dom(API_KEY, issueid_s):
    '''
    
    # {0} is the issue ID 
-   QUERY = 'http://comicvine.com/api/issue/4000-{0}/?api_key=' \
+   QUERY = 'http://comicvine.gamespot.com/api/issue/4000-{0}/?api_key=' \
       + API_KEY + __CLIENTID + '&format=xml'
       
    if issueid_s is None or issueid_s == '':
@@ -189,7 +193,7 @@ def __get_dom(url, lasttry=False):
    
    # 4. make sure the dom is valid (see bug 194)   
    if not error_occurred:
-      if not dom or not "status_code" in dom.__dict__:
+      if not dom or "status_code" not in dom.__dict__:
          if lasttry: raise DatabaseConnectionError(
             "Comic Vine", url, "empty comicvine dom: see bug 194")
          else: error_occurred = True
@@ -263,7 +267,7 @@ def wait_until_ready():
    global __next_query_time_ms, __QUERY_DELAY_MS 
    time_ms = (DateTime.Now-DateTime(1970,1,1)).TotalMilliseconds
    wait_ms = __next_query_time_ms - time_ms
-   if ( wait_ms > 0 ):
+   if wait_ms > 0:
       t = Thread(ThreadStart(lambda x=0: Thread.CurrentThread.Sleep(wait_ms)))
       t.Start()
       t.Join()

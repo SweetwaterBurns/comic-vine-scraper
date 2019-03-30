@@ -8,13 +8,14 @@ NOT call these functions directly.
 @author: Cory Banack
 '''
 
+import re
 import clr
 import cvconnection
 import log
-import re
 import utils
 from utils import is_string, sstr 
 from dbmodels import IssueRef, SeriesRef, Issue
+from resources import Resources
 import cvimprints
 
 clr.AddReference('System')
@@ -29,8 +30,12 @@ from System.Drawing import Image
 # memory leak (until the main app shuts down), but it is small and worth it.
 __series_details_cache = None
 
-# this is the comicvine api key to use when accessing the comicvine api
-# it must be set when calling initialize.
+# comicvine has a tendency to return WAY too many search results, so we 
+# limit the number returned.  set in _initialize() if user has overridden. 
+__max_search_results = 100
+
+# this is the comicvine api key to use when accessing the comicvine api.
+# it is set when calling _initialize().
 __api_key = ""
 
 
@@ -41,9 +46,10 @@ def _initialize(**kwargs):
    You must pass in a valid Comic Vine api key as a keyword argument to this
    method, like so:    _initialize(**{'cv_apikey','my-key-here'})
    '''
-   global __series_details_cache, __api_key
+   global __series_details_cache, __api_key, __max_search_results
    __series_details_cache = {}
-   __api_key = kwargs["cv_apikey"] if "cv_apikey" in kwargs else ""
+   if "cv_apikey" in kwargs: __api_key = kwargs["cv_apikey"] 
+   if "cv_maxresults" in kwargs: __max_search_results = kwargs["cv_maxresults"] 
    
    if not __api_key: raise Exception("You must set a ComicVine API key!") 
    
@@ -83,7 +89,7 @@ def _parse_key_tag(text_s):
 # =============================================================================
 def _check_magic_file(path_s):
    ''' ComicVine implementation of the identically named method in the db.py '''
-   series_key_s = None
+   series_ref = None
    file_s = None
    try:
       # 1. get the directory to search for a cvinfo file in, or None
@@ -104,28 +110,13 @@ def _check_magic_file(path_s):
             with StreamReader(file_s, Encoding.UTF8, False) as sr:
                line = sr.ReadToEnd()
                line = line.strip() if line else line
-               match = re.match(r"^.*?\b(49|4050)-(\d{2,})\b.*$", line)
-               line = match.group(2) if match else line
-               if utils.is_number(line):
-                  series_key_s = utils.sstr(int(line))
+               series_ref = __url_to_seriesref(line)
    except:
       log.debug_exc("bad cvinfo file: " + sstr(file_s))
       
-   # 4. did we find a series key?  if so, query comicvine to build a proper
-   #    SeriesRef object for that series key.
-   series_ref = None
-   if series_key_s:
-      try:
-         dom = cvconnection._query_series_details_dom(
-            __api_key, utils.sstr(series_key_s))
-         num_results_n = int(dom.number_of_total_results)
-         series_ref =\
-            __volume_to_seriesref(dom.results) if num_results_n==1 else None
-      except:
-         log.debug_exc("error getting SeriesRef for: " + sstr(series_key_s))
-         
    if file_s and not series_ref:
       log.debug("ignoring bad cvinfo file: ", sstr(file_s))
+
    return series_ref # may be None!
 
 
@@ -139,40 +130,32 @@ def _query_series_refs(search_terms_s, callback_function):
    # databases) before our first attempt at searching with them
    search_s = __cleanup_search_terms(search_terms_s, False)
    if search_s:
-      series_refs = __query_series_refs(search_s, callback_function)
       
-      # 2. if first search failed, cleanup terms more aggressively, try again
+      # 2. first see if the search term is actually a comicvine url, from 
+      #    which we can decode the correct series that the user wants.
+      if not series_refs:
+         series_ref = __url_to_seriesref(search_terms_s)
+         if series_ref: series_refs.add(series_ref)
+      
+      # 3. if that didn't work, search comicvine directly
+      if not series_refs:
+         series_refs = __query_series_refs(search_s, callback_function)
+      
+      # 4. if that didn't work, cleanup terms more aggressively and try again
       if not series_refs:
          altsearch_s = __cleanup_search_terms(search_s, True);
          if search_terms_s and altsearch_s != search_s:
             series_refs = __query_series_refs(altsearch_s, callback_function)
             
-      # 3. if second search failed, try interpreting the search terms as 
-      #    a comicvine ID or the URL for a comicvine volume's webpage
-      if not series_refs:
-         search_terms_s = search_terms_s.strip()
-         pattern = r"(^(49-|4050-)?(?<num>\d+)$)|" + \
-            r"(^https?://.*comicvine\.com/.*/(49-|4050-)(?<num>\d+)(/.*)?$)"
-            
-         match = re.match(pattern, search_terms_s, re.I)
-         if match:
-            series_key_s = match.group("num")
-            try:
-               dom = cvconnection._query_series_details_dom(
-                  __api_key, series_key_s)
-               num_results_n = int(dom.number_of_total_results)
-               if num_results_n == 1:
-                  series_refs.add(__volume_to_seriesref(dom.results))
-            except:
-               pass # happens when the user enters an non-existent key
-      
-   return series_refs
+   return series_refs # may be empty if nothing worked
 
 
 # =============================================================================
 def __query_series_refs(search_terms_s, callback_function):
    ''' A private implementation of the public method with the same name. '''
-   
+
+   global __max_search_results
+
    cancelled_b = [False]
    series_refs = set()
    
@@ -190,10 +173,12 @@ def __query_series_refs(search_terms_s, callback_function):
       #    them to the returned list. notice that the dom could contain single 
       #    volume OR a list of volumes in its 'volume' variable.  
       if not isinstance(dom.results.volume, list):
-         series_refs.add( __volume_to_seriesref(dom.results.volume) )
+         if len(series_refs) < __max_search_results:
+            series_refs.add( __volume_to_seriesref(dom.results.volume) )
       else:
          for volume in dom.results.volume:
-            series_refs.add( __volume_to_seriesref(volume) )
+            if len(series_refs) < __max_search_results:
+               series_refs.add( __volume_to_seriesref(volume) )
 
          # 3. if there were more than 100 results, we'll have to do some more 
          #    queries now to get the rest of them
@@ -206,7 +191,10 @@ def __query_series_refs(search_terms_s, callback_function):
             cancelled_b[0] = callback_function(
                iteration, num_remaining_pages)
 
-            while iteration < num_results_n and not cancelled_b[0]:
+            while iteration < num_results_n and \
+                  len(series_refs) < __max_search_results and \
+                  not cancelled_b[0]:
+
                # 4. query for the next batch of results, in a new dom
                dom = cvconnection._query_series_ids_dom(__api_key,
                   search_terms_s, iteration//RESULTS_PAGE_SIZE+1)
@@ -216,7 +204,7 @@ def __query_series_refs(search_terms_s, callback_function):
                cancelled_b[0] = callback_function(
                   iteration, num_remaining_pages)
 
-               if not "number_of_page_results" in dom.__dict__ or \
+               if "number_of_page_results" not in dom.__dict__ or \
                      int(dom.number_of_page_results) < 1 or \
                         not "volume" in dom.results.__dict__:
                   log.debug("WARNING: got empty results page") # issue 33, 396
@@ -225,12 +213,19 @@ def __query_series_refs(search_terms_s, callback_function):
                   #    and then add them to the returned list.  Again, the dom
                   #    could contain a single volume, OR a list.
                   if not isinstance(dom.results.volume, list):
-                     series_refs.add(__volume_to_seriesref(dom.results.volume))
+                     if len(series_refs) < __max_search_results:
+                        series_refs.add(
+                           __volume_to_seriesref(dom.results.volume))
                   else:
                      for volume in dom.results.volume:
-                        series_refs.add( __volume_to_seriesref(volume) )
+                        if len(series_refs) < __max_search_results:
+                           series_refs.add( __volume_to_seriesref(volume) )
                         
    # 6. Done.  series_refs now contained whatever SeriesRefs we could find
+   if not cancelled_b[0] and len( series_refs ) < num_results_n:
+      log.debug("...too many matches, only getting ",
+                "the first ", __max_search_results )
+
    return set() if cancelled_b[0] else series_refs   
 
    
@@ -242,6 +237,53 @@ def __volume_to_seriesref(volume):
    return SeriesRef( int(volume.id), sstr(volume.name), 
       sstr(volume.start_year).rstrip("- "), # see bug 334 
       sstr(publisher), sstr(volume.count_of_issues), __parse_image_url(volume))
+
+
+# ==========================================================================   
+def __url_to_seriesref(url_s):
+   ''' 
+   Converts a ComicVine URL into a SeriesRef.  The URL has to contain
+   a magic number of the form 4050-XXXXXXXX (a series) or 4000-XXXXXXXX
+   (an issue.)   If the given URL has a usable magic number, use it to query
+   the db and construct a SeriesRef for the series associated with that 
+   number.  Returns none if the url couldn't be converted, for any reason. 
+   '''
+   series_ref = None
+   
+   # 1. try interpreting the url as a comicvine issue (i.e. 4000-XXXXXXXX)
+   if not series_ref:
+      url_s = url_s.strip()
+      pattern=r"^.*?\b(4000)-(?<num>\d{2,})\b.*$"
+         
+      match = re.match(pattern, url_s, re.I)
+      if match:
+         issueid_s = match.group("num")
+         try:
+            dom = cvconnection._query_issue_details_dom( __api_key, issueid_s)
+            num_results_n = int(dom.number_of_total_results)
+            if num_results_n == 1:
+               # convert url into the series id for this issue
+               url_s = "4050-"+dom.results.volume.id
+         except:
+            pass # happens when the user enters an non-existent key
+
+   # 2. now try interpreting the url as a comicvine series (4050-XXXXXX) 
+   if not series_ref:
+      url_s = url_s.strip()
+      pattern=r"^.*?\b(49|4050)-(?<num>\d{2,})\b.*$"
+         
+      match = re.match(pattern, url_s, re.I)
+      if match:
+         seriesid_s = match.group("num")
+         try:
+            dom = cvconnection._query_series_details_dom(__api_key, seriesid_s)
+            num_results_n = int(dom.number_of_total_results)
+            if num_results_n == 1:
+               series_ref = __volume_to_seriesref(dom.results)
+         except:
+            pass # happens when the user enters an non-existent key
+
+   return series_ref
 
 
 # ==========================================================================   
@@ -259,26 +301,8 @@ def __cleanup_search_terms(search_terms_s, alt_b):
    '''
    # all of the symbols below cause inconsistency in title searches
    search_terms_s = search_terms_s.lower()
-   search_terms_s = search_terms_s.replace(r'`', '')
-   search_terms_s = search_terms_s = re.sub(r'(?<!\d)\.(?!\d)', 
-      '', search_terms_s) # delete . in "b.a.t", not in "2.0", see issue 337
-   search_terms_s = re.sub(r"'(?!s\b)", '', search_terms_s) \
-      if not alt_b else re.sub(r"'", '', search_terms_s)  # see issue 327
-   search_terms_s = search_terms_s.replace(r'_', ' ')
-   search_terms_s = search_terms_s.replace(r'-', ' ')
-   search_terms_s = re.sub(r":\s+", ' ', search_terms_s)
-   search_terms_s = re.sub(r'\b(c2c|ctc|noads+|presents)\b', '', search_terms_s)
-   search_terms_s = re.sub(r'\b(vs\.?|versus|and|or|tbp|the|an|of|a|is)\b',
-      '', search_terms_s)
-   search_terms_s = re.sub(r'giantsize', r'giant size', search_terms_s)
-   search_terms_s = re.sub(r'giant[- ]*sized', r'giant size', search_terms_s)
-   search_terms_s = re.sub(r'kingsize', r'king size', search_terms_s)
-   search_terms_s = re.sub(r'king[- ]*sized', r'king size', search_terms_s)
-   search_terms_s = re.sub(r"\bvolume\b", r"\bvol\b", search_terms_s)
-   search_terms_s = re.sub(r"\bvol\.\b", r"\bvol\b", search_terms_s)
-   
-   # here's a few comics that often get their names slightly wrong
-   search_terms_s = re.sub(r"cyberforce", r"\bcyber force\b", search_terms_s)
+   search_terms_s = re.sub(r" & ", ' and ', search_terms_s)
+   search_terms_s = re.sub(r'\b(c2c|ctc|noads+|tbp)\b', '', search_terms_s)
    
    # if the alternate search terms is requested, try to expand single number
    # words, and if that fails, try to contract them.
@@ -288,8 +312,8 @@ def __cleanup_search_terms(search_terms_s, alt_b):
    if alt_b and search_terms_s == orig_search_terms_s:
       search_terms_s = utils.convert_number_words(search_terms_s, False)
       
-   # strip out remaing punctuation except ' and ., which were handled above
-   word = re.compile(r"[\w'.]{1,}")
+   # strip out most remaing punctuation
+   word = re.compile(r"[\w':.-]{1,}")
    search_terms_s = ' '.join(word.findall(search_terms_s))
    
    return search_terms_s
@@ -426,6 +450,8 @@ def _query_image( ref, lasttry = False ):
       try:
          cvconnection.wait_until_ready() # throttle our request speed 
          request = WebRequest.Create(image_url_s)
+         request.UserAgent = "[ComicVineScraper, version " + \
+         Resources.SCRIPT_VERSION + "]"
          response = request.GetResponse()
          response_stream = response.GetResponseStream()
          retval = Image.FromStream(response_stream)
@@ -449,6 +475,8 @@ def _query_image( ref, lasttry = False ):
 def _query_issue(issue_ref, slow_data):
    ''' ComicVine implementation of the identically named method in the db.py '''
    
+   del slow_data; # unused 
+
    # interesting: can we implement a cache here?  could speed things up...
    issue = Issue(issue_ref)
    
@@ -511,8 +539,7 @@ def __issue_parse_simple_stuff(issue, dom):
          parts = [int(x) for x in dom.results.cover_date.split('-')]
          issue.pub_year_n = parts[0] if len(parts) >= 1 else None
          issue.pub_month_n = parts[1] if len(parts) >=2 else None
-         # corylow: can we ever add this back in??
-         #issue.pub_day_n = parts[2] if len(parts) >= 3 else None
+         issue.pub_day_n = parts[2] if len(parts) >= 3 else None
       except:
          pass # got an unrecognized date format...? should be "YYYY-MM-DD"
       
@@ -629,6 +656,7 @@ def __issue_parse_summary(issue, dom):
    NBSP = re.compile('&nbsp;?')
    MULTISPACES = re.compile(' {2,}')
    STRIP_TAGS = re.compile('<.*?>')
+   LIST_OF_COVERS = re.compile('(?is)list of covers.*$')
    if is_string(dom.results.description):
       summary_s = OVERVIEW.sub('', dom.results.description)
       summary_s = PARAGRAPH.sub('\n', summary_s)
@@ -640,8 +668,8 @@ def __issue_parse_summary(issue, dom):
       summary_s = summary_s.replace(r'&quot;', '"')
       summary_s = summary_s.replace(r'&lt;', '<')
       summary_s = summary_s.replace(r'&gt;', '>')
+      summary_s = LIST_OF_COVERS.sub('', summary_s);
       issue.summary_s = summary_s.strip()
-      
       
 #===========================================================================         
 def __issue_parse_roles(issue, dom):
